@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-dotenv
+openai
+langgraph
+langchain-core
+pydantic
+pyyaml
+fastmcp
+tenacity
+python-multipart
+ddgs
