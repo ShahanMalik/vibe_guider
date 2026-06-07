@@ -1,10 +1,10 @@
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from io import BytesIO
 import json
 import re
 import threading
 import zipfile
-from datetime import datetime, timezone
+import os
 from queue import Queue
 
 from fastapi import FastAPI
@@ -68,6 +68,86 @@ def _safe_filename(value: str) -> str:
     text = re.sub(r"[^a-z0-9]+", "-", text)
     text = text.strip("-")
     return text or "vibe-guider-bundle"
+
+
+def _extract_project_structure_nodes(text: str) -> List[Tuple[str, bool]]:
+    """Parse the Project Structure code block into ordered (path, is_dir) nodes."""
+    header = re.search(r"(?mi)^(?:#+\s*)?project structure\s*:?\s*$", text)
+    if not header:
+        return []
+
+    section = text[header.end():]
+    next_header = re.search(r"(?m)^#{1,6}\s+.+$", section)
+    if next_header:
+        section = section[:next_header.start()]
+
+    code_block = re.search(r"```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```", section)
+    lines = code_block.group(1).splitlines() if code_block else section.splitlines()
+
+    nodes: List[Tuple[str, bool]] = []
+    stack: List[str] = []
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if not line.strip():
+            continue
+        if re.fullmatch(r"[│|\s]+", line):
+            continue
+
+        match = re.match(r"^(?P<indent>(?:[│ ]{4})*)(?:(?P<branch>[├└]──)\s*)?(?P<name>.+?)\s*$", line)
+        if not match:
+            continue
+
+        indent = match.group("indent") or ""
+        branch = match.group("branch")
+        name = (match.group("name") or "").strip()
+        if not name:
+            continue
+
+        depth = len(indent) // 4
+        if branch:
+            depth += 1
+
+        cleaned_name = name.lstrip("/").strip()
+        if not cleaned_name:
+            continue
+
+        is_dir = name.startswith("/") or cleaned_name.endswith("/")
+        cleaned_name = cleaned_name.rstrip("/")
+
+        if depth == 0:
+            stack = [cleaned_name]
+        else:
+            stack = stack[:depth] + [cleaned_name]
+
+        nodes.append(("/".join(stack), is_dir))
+
+    return nodes
+
+
+def _node_with_parents(path: str, is_dir: bool) -> List[Tuple[str, bool]]:
+    parts = [part for part in path.split("/") if part]
+    entries: List[Tuple[str, bool]] = []
+    for index in range(1, len(parts)):
+        entries.append(("/".join(parts[:index]), True))
+    entries.append((path, is_dir))
+    return entries
+
+
+def _write_zip_entry(zf: zipfile.ZipFile, archive_path: str, is_dir: bool, source_root: str = ""):
+    archive_path = archive_path.strip("/")
+    if not archive_path:
+        return
+
+    if is_dir:
+        zf.writestr(f"{archive_path}/", "")
+        return
+
+    source_path = os.path.join(source_root, archive_path) if source_root else ""
+    if source_root and os.path.isfile(source_path):
+        zf.write(source_path, arcname=archive_path)
+    else:
+        zf.writestr(archive_path, "")
 
 
 @app.get("/")
@@ -173,25 +253,21 @@ def ask_stream(q: UserQuery):
 def download_zip(payload: ZipBundleRequest):
     safe_name = _safe_filename(payload.title)
     archive_name = f"{safe_name}.zip"
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(
-            "README.md",
-            payload.content.strip() + "\n",
-        )
-        zf.writestr(
-            "manifest.json",
-            json.dumps(
-                {
-                    "title": payload.title,
-                    "archive": archive_name,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                },
-                indent=2,
-            )
-            + "\n",
-        )
+        structure_nodes = _extract_project_structure_nodes(payload.content)
+        if not structure_nodes:
+            structure_nodes = [("vibe-guider-bundle", True)]
+
+        seen = set()
+        for path, is_dir in structure_nodes:
+            for parent_path, parent_is_dir in _node_with_parents(path, is_dir):
+                if parent_path in seen:
+                    continue
+                seen.add(parent_path)
+                _write_zip_entry(zf, parent_path, parent_is_dir, source_root=repo_root)
 
     buffer.seek(0)
     headers = {
