@@ -4,7 +4,7 @@ import json
 import re
 import threading
 import zipfile
-import os
+from datetime import datetime, timezone
 from queue import Queue
 
 from fastapi import FastAPI
@@ -70,57 +70,126 @@ def _safe_filename(value: str) -> str:
     return text or "vibe-guider-bundle"
 
 
-def _extract_project_structure_nodes(text: str) -> List[Tuple[str, bool]]:
-    """Parse the Project Structure code block into ordered (path, is_dir) nodes."""
-    header = re.search(r"(?mi)^(?:#+\s*)?project structure\s*:?\s*$", text)
-    if not header:
-        return []
+def _clean_tree_line_name(name: str) -> str:
+    """Remove explanations/comments that often appear after tree entries."""
+    name = (name or "").strip()
+    name = re.sub(r"\s+#.*$", "", name).strip()
+    name = re.split(r"\s+(?:-|–|—)\s+", name, maxsplit=1)[0].strip()
+    name = name.strip("`'\"")
+    return name
 
-    section = text[header.end():]
-    next_header = re.search(r"(?m)^#{1,6}\s+.+$", section)
-    if next_header:
-        section = section[:next_header.start()]
+
+def _sanitize_archive_path(path: str) -> str:
+    """Normalize a generated path and reject unsafe zip paths."""
+    raw_parts = re.split(r"[/\\]+", (path or "").strip().strip("/\\"))
+    safe_parts: List[str] = []
+
+    for part in raw_parts:
+        part = part.strip()
+        if not part or part in {".", ".."}:
+            continue
+        part = re.sub(r"[\x00-\x1f\x7f]", "", part)
+        part = re.sub(r"[:*?\"<>|]", "-", part)
+        part = part.strip()
+        if part:
+            safe_parts.append(part)
+
+    return "/".join(safe_parts)
+
+
+def _extract_project_structure_section(text: str) -> str:
+    """Find the Project Structure section; fall back to the first tree-like code block."""
+    header = re.search(
+        r"(?mi)^\s*(?:#{1,6}\s*)?(?:\*\*)?\d*\.?\s*project\s+structure\s*(?:\*\*)?\s*:?\s*$",
+        text or "",
+    )
+    if header:
+        section = text[header.end():]
+        next_header = re.search(r"(?m)^\s*#{1,6}\s+.+$", section)
+        if next_header:
+            section = section[:next_header.start()]
+        return section
+
+    for match in re.finditer(r"```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```", text or ""):
+        candidate = match.group(1)
+        if any(symbol in candidate for symbol in ("├──", "└──", "│")) or re.search(r"(?m)^\s*[-*]?\s*[\w.-]+/", candidate):
+            return candidate
+
+    return ""
+
+
+def _extract_project_structure_nodes(text: str) -> List[Tuple[str, bool]]:
+    """Parse a Project Structure tree into ordered (path, is_dir) nodes."""
+    section = _extract_project_structure_section(text)
+    if not section:
+        return []
 
     code_block = re.search(r"```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)\n```", section)
     lines = code_block.group(1).splitlines() if code_block else section.splitlines()
 
-    nodes: List[Tuple[str, bool]] = []
+    raw_nodes: List[Tuple[str, bool]] = []
     stack: List[str] = []
 
     for raw_line in lines:
         line = raw_line.rstrip()
-        if not line.strip():
-            continue
-        if re.fullmatch(r"[│|\s]+", line):
+        if not line.strip() or re.fullmatch(r"[│|\s]+", line):
             continue
 
-        match = re.match(r"^(?P<indent>(?:[│ ]{4})*)(?:(?P<branch>[├└]──)\s*)?(?P<name>.+?)\s*$", line)
+        match = re.match(
+            r"^(?P<prefix>(?:[│| ]{4}|\t)*)(?:(?P<branch>[├└+\\|-]+──|[+\\|-]+--|[-*])\s*)?(?P<name>.+?)\s*$",
+            line,
+        )
         if not match:
             continue
 
-        indent = match.group("indent") or ""
+        prefix = (match.group("prefix") or "").replace("\t", "    ")
         branch = match.group("branch")
-        name = (match.group("name") or "").strip()
-        if not name:
+        original_name = (match.group("name") or "").strip()
+        cleaned_name = _clean_tree_line_name(original_name)
+        if not cleaned_name or cleaned_name.startswith(("#", "//")):
             continue
 
-        depth = len(indent) // 4
-        if branch:
+        depth = len(prefix) // 4
+        if branch and branch not in {"-", "*"}:
             depth += 1
 
-        cleaned_name = name.lstrip("/").strip()
+        is_dir = cleaned_name.endswith("/")
+        cleaned_name = cleaned_name.rstrip("/")
+        cleaned_name = _sanitize_archive_path(cleaned_name)
         if not cleaned_name:
             continue
 
-        is_dir = name.startswith("/") or cleaned_name.endswith("/")
-        cleaned_name = cleaned_name.rstrip("/")
-
-        if depth == 0:
+        if "/" in cleaned_name:
+            current_path = cleaned_name
+        elif depth == 0:
             stack = [cleaned_name]
+            current_path = cleaned_name
         else:
             stack = stack[:depth] + [cleaned_name]
+            current_path = "/".join(stack)
 
-        nodes.append(("/".join(stack), is_dir))
+        raw_nodes.append((current_path, is_dir))
+
+    if not raw_nodes:
+        return []
+
+    parent_paths = set()
+    for path, _ in raw_nodes:
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            parent_paths.add("/".join(parts[:index]))
+
+    nodes: List[Tuple[str, bool]] = []
+    seen = set()
+    for path, is_dir in raw_nodes:
+        safe_path = _sanitize_archive_path(path)
+        if not safe_path:
+            continue
+        final_is_dir = is_dir or safe_path in parent_paths
+        key = (safe_path, final_is_dir)
+        if key not in seen:
+            nodes.append((safe_path, final_is_dir))
+            seen.add(key)
 
     return nodes
 
@@ -130,24 +199,43 @@ def _node_with_parents(path: str, is_dir: bool) -> List[Tuple[str, bool]]:
     entries: List[Tuple[str, bool]] = []
     for index in range(1, len(parts)):
         entries.append(("/".join(parts[:index]), True))
-    entries.append((path, is_dir))
+    entries.append(("/".join(parts), is_dir))
     return entries
 
 
-def _write_zip_entry(zf: zipfile.ZipFile, archive_path: str, is_dir: bool, source_root: str = ""):
-    archive_path = archive_path.strip("/")
+def _ensure_single_root(nodes: List[Tuple[str, bool]], root_name: str) -> List[Tuple[str, bool]]:
+    if not nodes:
+        return [(root_name, True)]
+
+    top_level = {path.split("/", 1)[0] for path, _ in nodes if path}
+    if len(top_level) <= 1:
+        return nodes
+
+    return [(f"{root_name}/{path}", is_dir) for path, is_dir in nodes]
+
+
+def _project_root(nodes: List[Tuple[str, bool]], fallback: str) -> str:
+    for path, _ in nodes:
+        if path:
+            return path.split("/", 1)[0]
+    return fallback
+
+
+def _write_zip_entry(zf: zipfile.ZipFile, archive_path: str, is_dir: bool, content: str = ""):
+    archive_path = _sanitize_archive_path(archive_path)
     if not archive_path:
         return
 
     if is_dir:
-        zf.writestr(f"{archive_path}/", "")
+        zf.writestr(f"{archive_path.rstrip('/')}/", "")
         return
 
-    source_path = os.path.join(source_root, archive_path) if source_root else ""
-    if source_root and os.path.isfile(source_path):
-        zf.write(source_path, arcname=archive_path)
-    else:
-        zf.writestr(archive_path, "")
+    zf.writestr(archive_path, content)
+
+
+def _zip_contains(seen_paths: set, archive_path: str) -> bool:
+    archive_path = _sanitize_archive_path(archive_path).rstrip("/")
+    return archive_path in seen_paths or f"{archive_path}/" in seen_paths
 
 
 @app.get("/")
@@ -253,21 +341,52 @@ def ask_stream(q: UserQuery):
 def download_zip(payload: ZipBundleRequest):
     safe_name = _safe_filename(payload.title)
     archive_name = f"{safe_name}.zip"
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         structure_nodes = _extract_project_structure_nodes(payload.content)
-        if not structure_nodes:
-            structure_nodes = [("vibe-guider-bundle", True)]
+        structure_nodes = _ensure_single_root(structure_nodes, safe_name)
+        root_dir = _project_root(structure_nodes, safe_name)
 
-        seen = set()
+        seen_paths = set()
         for path, is_dir in structure_nodes:
             for parent_path, parent_is_dir in _node_with_parents(path, is_dir):
-                if parent_path in seen:
+                normalized_path = _sanitize_archive_path(parent_path)
+                zip_key = f"{normalized_path}/" if parent_is_dir else normalized_path
+                if not normalized_path or zip_key in seen_paths:
                     continue
-                seen.add(parent_path)
-                _write_zip_entry(zf, parent_path, parent_is_dir, source_root=repo_root)
+                seen_paths.add(zip_key)
+                _write_zip_entry(zf, normalized_path, parent_is_dir)
+
+        guide_path = f"{root_dir}/VIBE_GUIDER_GUIDE.md"
+        readme_path = f"{root_dir}/README.md"
+        if not _zip_contains(seen_paths, readme_path):
+            guide_path = readme_path
+
+        _write_zip_entry(zf, guide_path, False, payload.content.strip() + "\n")
+        seen_paths.add(_sanitize_archive_path(guide_path))
+
+        manifest_path = f"{root_dir}/vibe-guider-manifest.json"
+        _write_zip_entry(
+            zf,
+            manifest_path,
+            False,
+            json.dumps(
+                {
+                    "title": payload.title,
+                    "archive": archive_name,
+                    "root": root_dir,
+                    "generated_from": "vibe-guider",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "structure_nodes": [
+                        {"path": path, "type": "directory" if is_dir else "file"}
+                        for path, is_dir in structure_nodes
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+        )
 
     buffer.seek(0)
     headers = {
